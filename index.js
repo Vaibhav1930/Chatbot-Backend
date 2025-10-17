@@ -1,44 +1,78 @@
-/**
- * Chat Module - Server (Node.js + Express + Socket.IO)
- * Human-readable, well-commented code intended for learning and integration.
- *
- * NOTE: For Supabase, we connect directly using a Postgres connection string.
- * In production you might use Supabase client or Row Level Security and service keys.
- */
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const { createClient } = require('@supabase/supabase-js'); // ✅ NEW
 const db = require('./lib/db');
+const { v4: uuidv4 } = require('uuid'); // ✅ For unique filenames
 
 const app = express();
 const server = http.createServer(app);
 
-// Socket.IO setup
 const io = new Server(server, {
   cors: {
     origin: process.env.CLIENT_URL || '*',
-    methods: ['GET', 'POST']
+    methods: ['GET', 'POST'],
+  },
+});
+
+app.use(
+  cors({
+    origin: process.env.CLIENT_URL || '*',
+  })
+);
+app.use(bodyParser.json());
+
+// ✅ Initialize Supabase client
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+// ✅ Simple health check
+app.get('/', (req, res) => {
+  res.json({ status: 'Chat module server with Supabase storage is running' });
+});
+
+// ✅ Upload file to Supabase Storage
+app.post('/api/upload', async (req, res) => {
+  try {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', async () => {
+      const buffer = Buffer.concat(chunks);
+      const filename = `${uuidv4()}`;
+
+      const contentType = req.headers['content-type'] || 'application/octet-stream';
+      const fileExt = contentType.split('/')[1] || 'bin';
+      const path = `${filename}.${fileExt}`;
+
+      // Upload to Supabase bucket
+      const { error: uploadError } = await supabase.storage
+        .from(process.env.SUPABASE_BUCKET_NAME)
+        .upload(path, buffer, {
+          contentType,
+          upsert: false,
+        });
+
+      if (uploadError) throw uploadError;
+
+      // Generate public URL
+      const { data } = supabase.storage
+        .from(process.env.SUPABASE_BUCKET_NAME)
+        .getPublicUrl(path);
+
+      res.json({ url: data.publicUrl });
+    });
+  } catch (err) {
+    console.error('Supabase upload error:', err.message);
+    res.status(500).json({ error: 'File upload failed' });
   }
 });
 
-app.use(cors({
-  origin: process.env.CLIENT_URL || '*'
-}));
-app.use(bodyParser.json());
-
-// Simple health check
-app.get('/', (req, res) => {
-  res.json({ status: 'Chat module server is running' });
-});
-
-/**
- * REST API endpoints
- */
-
-// Search users (by name or email)
+// ✅ Search users
 app.get('/api/users', async (req, res) => {
   const { search } = req.query;
   try {
@@ -50,10 +84,9 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
-// Get messages between the authenticated user (assumed) and another userId
+// ✅ Fetch messages
 app.get('/api/messages/:userId', async (req, res) => {
   const otherUserId = parseInt(req.params.userId, 10);
-  // NOTE: We don't implement auth here. The client should supply its userId via query for demo.
   const currentUserId = parseInt(req.query.myUserId, 10) || null;
   if (!currentUserId) {
     return res.status(400).json({ error: 'Missing myUserId in query string' });
@@ -67,17 +100,20 @@ app.get('/api/messages/:userId', async (req, res) => {
   }
 });
 
-// Send a message (persist and emit)
+// ✅ Send a message
 app.post('/api/messages', async (req, res) => {
-  const { sender_id, receiver_id, content } = req.body;
-  if (!sender_id || !receiver_id || !content) {
-    return res.status(400).json({ error: 'sender_id, receiver_id and content are required' });
+  const { sender_id, receiver_id, content, attachment_url } = req.body;
+  if (!sender_id || !receiver_id) {
+    return res.status(400).json({ error: 'sender_id and receiver_id are required' });
   }
   try {
-    const saved = await db.createMessage(sender_id, receiver_id, content);
-    // emit to receiver room
+    const saved = await db.createMessage(
+      sender_id,
+      receiver_id,
+      content || '',
+      attachment_url || null
+    );
     io.to(`user_${receiver_id}`).emit('new_message', saved);
-    // echo back to sender as confirmation
     io.to(`user_${sender_id}`).emit('new_message', saved);
     res.json(saved);
   } catch (err) {
@@ -86,16 +122,11 @@ app.post('/api/messages', async (req, res) => {
   }
 });
 
-/**
- * Socket.IO: very simple convention
- * - clients join a room called `user_<userId>` after connecting and telling the server their userId
- * - server emits 'new_message' events into the target user's room when a message is created
- */
+// ✅ Socket setup
 io.on('connection', (socket) => {
   console.log('Socket connected', socket.id);
 
   socket.on('join', (payload) => {
-    // payload: { userId: 123 }
     const userId = payload && payload.userId;
     if (userId) {
       const room = `user_${userId}`;
